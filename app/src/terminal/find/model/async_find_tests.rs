@@ -1,11 +1,13 @@
 //! Tests for async find functionality.
 
 use std::collections::HashMap;
+use std::ops::RangeInclusive;
 use std::sync::Arc;
 
 use parking_lot::FairMutex;
-use warpui::{App, EntityId};
+use warpui::{App, EntityId, ModelHandle};
 
+use super::work_queue::FindWorkQueue;
 use super::{
     AbsoluteMatch, AsyncFindConfig, AsyncFindController, AsyncFindStatus, BlockFindResults,
     FindTaskMessage, is_query_refinement,
@@ -278,6 +280,7 @@ fn test_message_processing_updates_state() {
                     FindTaskMessage::BlockGridMatches {
                         block_index: BlockIndex(1),
                         grid_type: GridType::Output,
+                        row_range: 0..=1,
                         matches: vec![make_match_at(0, 0, 2), make_match_at(1, 0, 2)],
                     },
                     ctx,
@@ -943,4 +946,143 @@ fn test_focused_match_index_walks_across_terminal_and_ai_blocks() {
         .expect("Index 1 should resolve to terminal match.");
     assert_eq!(focused_terminal.block_index, BlockIndex(0));
     assert_eq!(focused_terminal.grid_type, GridType::Output);
+}
+
+/// Creates a find model whose controller has an active find and work queue, but no background
+/// task, so tests can deliver `FindTaskMessage`s in an exact order.
+fn add_find_model_with_active_find(app: &mut App) -> ModelHandle<TerminalFindModel> {
+    let terminal_model = Arc::new(FairMutex::new(TerminalModel::mock(None, None)));
+    app.add_model(|ctx| {
+        let mut model = TerminalFindModel::new(terminal_model.clone(), ctx);
+        let mut controller = AsyncFindController::new(terminal_model);
+        controller.current_config = AsyncFindConfig::from_options(
+            &FindOptions {
+                query: Some("foo".to_owned().into()),
+                ..Default::default()
+            },
+            BlockSortDirection::MostRecentLast,
+        );
+        controller.work_queue = Some(FindWorkQueue::new());
+        controller.set_test_status(AsyncFindStatus::Scanning);
+        model.async_find_controller = Some(controller);
+        model
+    })
+}
+
+fn process_messages(
+    app: &mut App,
+    find_model: &ModelHandle<TerminalFindModel>,
+    messages: Vec<FindTaskMessage>,
+) {
+    find_model.update(app, |model, ctx| {
+        let controller = model.async_find_controller.as_mut().unwrap();
+        for message in messages {
+            controller.process_message(message, ctx);
+        }
+    });
+}
+
+fn full_block_chunk(rows: RangeInclusive<u64>, match_rows: &[u64]) -> FindTaskMessage {
+    FindTaskMessage::BlockGridMatches {
+        block_index: BlockIndex(0),
+        grid_type: GridType::Output,
+        row_range: rows,
+        matches: match_rows.iter().copied().map(make_match).collect(),
+    }
+}
+
+fn dirty_range(rows: RangeInclusive<u64>, match_rows: &[u64]) -> FindTaskMessage {
+    FindTaskMessage::DirtyRangeMatches {
+        block_index: BlockIndex(0),
+        grid_type: GridType::Output,
+        dirty_range: rows,
+        matches: match_rows.iter().copied().map(make_match).collect(),
+    }
+}
+
+fn stored_match_rows(app: &mut App, find_model: &ModelHandle<TerminalFindModel>) -> Vec<u64> {
+    find_model.update(app, |model, _ctx| {
+        model
+            .async_find_controller
+            .as_ref()
+            .unwrap()
+            .matches_for_block_grid(BlockIndex(0), GridType::Output)
+            .map(|matches| matches.iter().map(AbsoluteMatch::start_row).collect())
+            .unwrap_or_default()
+    })
+}
+
+/// Regression test for warpdotdev/warp#14231: dirty-range results that were already in flight when
+/// a full rescan was requested land after the block's results are cleared, followed by the full
+/// rescan's chunks starting at row 0.
+#[test]
+fn test_full_rescan_racing_in_flight_dirty_results_keeps_matches_sorted_and_unique() {
+    App::test((), |mut app| async move {
+        initialize_settings_for_tests(&mut app);
+        let find_model = add_find_model_with_active_find(&mut app);
+
+        process_messages(
+            &mut app,
+            &find_model,
+            vec![
+                full_block_chunk(0..=49, &[0, 10, 20, 30, 40]),
+                full_block_chunk(50..=99, &[50, 60, 70, 80, 90]),
+            ],
+        );
+
+        find_model.update(&mut app, |model, _ctx| {
+            model
+                .async_find_controller
+                .as_mut()
+                .unwrap()
+                .invalidate_block(BlockIndex(0), None);
+        });
+        assert!(stored_match_rows(&mut app, &find_model).is_empty());
+
+        process_messages(
+            &mut app,
+            &find_model,
+            vec![
+                dirty_range(70..=84, &[70, 80]),
+                dirty_range(85..=99, &[90]),
+                full_block_chunk(0..=49, &[0, 10, 20, 30, 40]),
+                full_block_chunk(50..=99, &[50, 60, 70, 80, 90]),
+                full_block_chunk(100..=105, &[100]),
+                dirty_range(100..=120, &[100, 110, 120]),
+            ],
+        );
+
+        let expected_rows = (0..=120).step_by(10).collect::<Vec<u64>>();
+        assert_eq!(stored_match_rows(&mut app, &find_model), expected_rows);
+        let (match_count, focused_match_index) = find_model.update(&mut app, |model, _ctx| {
+            let controller = model.async_find_controller.as_ref().unwrap();
+            (controller.match_count(), controller.focused_match_index())
+        });
+        assert_eq!(match_count, expected_rows.len());
+        assert_eq!(focused_match_index, Some(0));
+    });
+}
+
+#[test]
+fn test_empty_full_block_chunk_clears_stale_matches_in_its_rows() {
+    App::test((), |mut app| async move {
+        initialize_settings_for_tests(&mut app);
+        let find_model = add_find_model_with_active_find(&mut app);
+
+        process_messages(
+            &mut app,
+            &find_model,
+            vec![
+                dirty_range(70..=84, &[70, 80]),
+                dirty_range(150..=160, &[150]),
+                full_block_chunk(0..=99, &[]),
+            ],
+        );
+
+        assert_eq!(stored_match_rows(&mut app, &find_model), vec![150]);
+        let match_count = find_model.update(&mut app, |model, _ctx| {
+            model.async_find_controller.as_ref().unwrap().match_count()
+        });
+        assert_eq!(match_count, 1);
+    });
 }

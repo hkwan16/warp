@@ -57,16 +57,17 @@ impl std::fmt::Display for AsyncFindStatus {
 /// Message streamed from background find task to main thread.
 #[derive(Debug)]
 pub enum FindTaskMessage {
-    /// Matches found in a terminal block's grid.
+    /// Matches found in one chunk of a full scan of a terminal block's grid.
     BlockGridMatches {
         block_index: BlockIndex,
         grid_type: GridType,
+        /// The scanned rows in absolute row coordinates. Existing matches in these rows are
+        /// replaced, because results already in flight for this block (e.g. dirty-range results
+        /// that land after a full rescan cleared the block) may have repopulated them.
+        row_range: RangeInclusive<u64>,
         matches: Vec<AbsoluteMatch>,
     },
     /// Matches found in a dirty range within a terminal block's grid.
-    ///
-    /// Unlike `BlockGridMatches` (which extends results), these matches are
-    /// merged into existing results using `update_dirty_matches`.
     DirtyRangeMatches {
         block_index: BlockIndex,
         grid_type: GridType,
@@ -867,41 +868,39 @@ impl AsyncFindController {
             FindTaskMessage::BlockGridMatches {
                 block_index,
                 grid_type,
+                row_range,
                 matches,
             } => {
-                if !matches.is_empty() {
-                    // Store TotalIndex for this block if not already known
-                    // (e.g. the block was added after the initial scan).
-                    if !self
+                let has_matches = !matches.is_empty();
+                // Store TotalIndex for this block if not already known
+                // (e.g. the block was added after the initial scan).
+                if has_matches
+                    && !self
                         .block_results
                         .terminal_total_indices
                         .contains_key(&block_index)
-                    {
-                        let total_index = {
-                            let model = self.terminal_model.lock();
-                            total_index_for_block(block_index, model.block_list())
-                        };
-                        self.block_results
-                            .terminal_total_indices
-                            .insert(block_index, total_index);
-                    }
-
+                {
+                    let total_index = {
+                        let model = self.terminal_model.lock();
+                        total_index_for_block(block_index, model.block_list())
+                    };
                     self.block_results
-                        .terminal_matches
-                        .entry((block_index, grid_type))
-                        .or_default()
-                        .extend(matches);
-
-                    // Auto-select the first match when results first arrive.
-                    if self.focused_match_index.is_none() {
-                        self.focused_match_index = Some(0);
-                    }
-
-                    // Mark any of the newly-arrived output matches that fall in
-                    // filter-hidden rows so they're excluded from the count,
-                    // focus, and highlights (also re-clamps focus).
-                    self.recompute_filtered_for_block(block_index);
+                        .terminal_total_indices
+                        .insert(block_index, total_index);
                 }
+
+                self.block_results
+                    .update_dirty_matches(block_index, grid_type, row_range, matches);
+
+                // Auto-select the first match when results first arrive.
+                if has_matches && self.focused_match_index.is_none() {
+                    self.focused_match_index = Some(0);
+                }
+
+                // Mark any of the newly-arrived output matches that fall in
+                // filter-hidden rows so they're excluded from the count,
+                // focus, and highlights (also re-clamps focus).
+                self.recompute_filtered_for_block(block_index);
             }
             FindTaskMessage::DirtyRangeMatches {
                 block_index,
