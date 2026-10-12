@@ -5,7 +5,7 @@
 //! pulls work items from a shared [`FindWorkQueue`] and streams results
 //! back via an `async_channel`.
 
-use std::ops::RangeInclusive;
+use std::ops::{Range, RangeInclusive};
 use std::sync::Arc;
 
 use futures_lite::future::yield_now;
@@ -85,16 +85,13 @@ async fn run_find_task_loop(
                 block_index,
                 grid_type,
                 row_range,
-                num_lines_truncated,
             } => {
                 scan_grid_chunked(
                     block_index,
                     grid_type,
                     *row_range.start(),
                     Some(*row_range.end() + 1),
-                    ScanResultMode::DirtyRange {
-                        num_lines_truncated,
-                    },
+                    ScanResultMode::DirtyRange,
                     &terminal_model,
                     &dfas,
                     &result_tx,
@@ -161,13 +158,45 @@ async fn scan_terminal_block_chunked(
 /// for empty chunks, so that old matches in the chunk's rows are cleared.
 #[derive(Clone, Copy)]
 enum ScanResultMode {
-    /// Send [`FindTaskMessage::BlockGridMatches`] per chunk, converting the scanned row range to
-    /// absolute coordinates using the grid's truncation offset at scan time.
+    /// Send [`FindTaskMessage::BlockGridMatches`] per chunk.
     FullBlock,
-    /// Send [`FindTaskMessage::DirtyRangeMatches`] per chunk, converting the
-    /// scanned row range to absolute coordinates using the provided truncation
-    /// offset.
-    DirtyRange { num_lines_truncated: u64 },
+    /// Send [`FindTaskMessage::DirtyRangeMatches`] per chunk.
+    DirtyRange,
+}
+
+/// The rows of one scan chunk, in both grid and absolute coordinates.
+#[derive(Debug, PartialEq, Eq)]
+struct ChunkRows {
+    grid_rows: Range<usize>,
+    absolute_rows: RangeInclusive<u64>,
+    /// Whether this chunk reaches the end of the requested range (or of the grid).
+    is_last: bool,
+}
+
+/// Returns the next chunk of rows to scan, starting at absolute row `absolute_start` and ending
+/// before absolute row `absolute_end` (or at the end of the grid if `None`), given the grid's
+/// current truncation and size. Rows already truncated from scrollback are skipped. Returns
+/// `None` if no rows of the range remain in the grid.
+fn next_chunk_rows(
+    absolute_start: u64,
+    absolute_end: Option<u64>,
+    num_lines_truncated: u64,
+    total_rows: usize,
+) -> Option<ChunkRows> {
+    let total_rows = total_rows as u64;
+    let grid_start = absolute_start.saturating_sub(num_lines_truncated);
+    let grid_end = absolute_end
+        .map_or(total_rows, |end| end.saturating_sub(num_lines_truncated))
+        .min(total_rows);
+    if grid_start >= grid_end {
+        return None;
+    }
+    let chunk_end = (grid_start + ROWS_PER_CHUNK as u64).min(grid_end);
+    Some(ChunkRows {
+        grid_rows: grid_start as usize..chunk_end as usize,
+        absolute_rows: grid_start + num_lines_truncated..=chunk_end - 1 + num_lines_truncated,
+        is_last: chunk_end >= grid_end,
+    })
 }
 
 /// Scans a range of rows within a single grid in chunks, releasing the
@@ -177,17 +206,20 @@ enum ScanResultMode {
 /// function; the [`ScanResultMode`] determines the message type sent per
 /// chunk.
 ///
+/// Scan positions are tracked in absolute rows and converted to grid rows per chunk, under the same
+/// lock as the scan, because scrollback can be truncated while the lock is released.
+///
 /// # Arguments
-/// * `start_row` — First row to scan (inclusive).
-/// * `end_row` — Upper bound on rows to scan (exclusive). `None` scans to
+/// * `start_row` - First absolute row to scan (inclusive).
+/// * `end_row` - Upper bound on absolute rows to scan (exclusive). `None` scans to
 ///   the end of the grid.
-/// * `mode` — Determines the message type sent per chunk.
+/// * `mode` - Determines the message type sent per chunk.
 #[allow(clippy::too_many_arguments)]
 async fn scan_grid_chunked(
     block_index: BlockIndex,
     grid_type: GridType,
-    start_row: usize,
-    end_row: Option<usize>,
+    start_row: u64,
+    end_row: Option<u64>,
     mode: ScanResultMode,
     terminal_model: &Arc<FairMutex<TerminalModel>>,
     dfas: &RegexDFAs,
@@ -212,41 +244,32 @@ async fn scan_grid_chunked(
             };
 
             let grid_handler = grid.grid_handler();
-            let total_rows = grid_handler.total_rows();
-            let effective_end = end_row.unwrap_or(total_rows).min(total_rows);
-
-            if current_row >= effective_end {
+            let Some(chunk) = next_chunk_rows(
+                current_row,
+                end_row,
+                grid_handler.num_lines_truncated(),
+                grid_handler.total_rows(),
+            ) else {
                 return;
-            }
+            };
 
-            let chunk_end = (current_row + ROWS_PER_CHUNK).min(effective_end);
-
-            let point_matches = scan_grid_range(grid_handler, dfas, current_row, chunk_end);
+            let point_matches = scan_grid_range(
+                grid_handler,
+                dfas,
+                chunk.grid_rows.start,
+                chunk.grid_rows.end,
+            );
             let matches: Vec<AbsoluteMatch> = point_matches
                 .iter()
                 .map(|range| AbsoluteMatch::from_range(range, grid_handler))
                 .collect();
 
-            let num_lines_truncated = match mode {
-                ScanResultMode::FullBlock => grid_handler.num_lines_truncated(),
-                ScanResultMode::DirtyRange {
-                    num_lines_truncated,
-                } => num_lines_truncated,
-            };
-            let absolute_row_range = current_row as u64 + num_lines_truncated
-                ..=(chunk_end - 1) as u64 + num_lines_truncated;
-
             let elapsed = lock_start.elapsed();
-            (
-                matches,
-                absolute_row_range,
-                chunk_end,
-                effective_end,
-                elapsed,
-            )
+            (matches, chunk, elapsed)
         };
 
-        let (mut matches, absolute_row_range, chunk_end, effective_end, elapsed) = chunk_result;
+        let (mut matches, chunk, elapsed) = chunk_result;
+        let next_row = *chunk.absolute_rows.end() + 1;
 
         // find_in_range returns matches in descending order; reverse to ascending.
         matches.reverse();
@@ -255,23 +278,23 @@ async fn scan_grid_chunked(
             ScanResultMode::FullBlock => FindTaskMessage::BlockGridMatches {
                 block_index,
                 grid_type,
-                row_range: absolute_row_range,
+                row_range: chunk.absolute_rows,
                 matches,
             },
-            ScanResultMode::DirtyRange { .. } => FindTaskMessage::DirtyRangeMatches {
+            ScanResultMode::DirtyRange => FindTaskMessage::DirtyRangeMatches {
                 block_index,
                 grid_type,
-                dirty_range: absolute_row_range,
+                dirty_range: chunk.absolute_rows,
                 matches,
             },
         };
         let _ = result_tx.send(message).await;
 
-        if chunk_end >= effective_end {
+        if chunk.is_last {
             break;
         }
 
-        current_row = chunk_end;
+        current_row = next_row;
 
         // Yield to let other tasks run if we held the lock for a while.
         if elapsed.as_millis() > MAX_LOCK_DURATION_MS as u128 / 2 {
@@ -293,3 +316,7 @@ fn scan_grid_range(
 
     grid.find_in_range(dfas, start_point, end_point).collect()
 }
+
+#[cfg(test)]
+#[path = "background_task_tests.rs"]
+mod tests;
