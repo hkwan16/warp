@@ -157,15 +157,16 @@ async fn scan_terminal_block_chunked(
     }
 }
 
-/// Controls how each chunk's matches are sent to the main thread.
+/// Controls how each chunk's matches are sent to the main thread. Messages are always sent, even
+/// for empty chunks, so that old matches in the chunk's rows are cleared.
+#[derive(Clone, Copy)]
 enum ScanResultMode {
-    /// Send [`FindTaskMessage::BlockGridMatches`] per chunk. Empty chunks are
-    /// skipped (no message sent).
+    /// Send [`FindTaskMessage::BlockGridMatches`] per chunk, converting the scanned row range to
+    /// absolute coordinates using the grid's truncation offset at scan time.
     FullBlock,
     /// Send [`FindTaskMessage::DirtyRangeMatches`] per chunk, converting the
     /// scanned row range to absolute coordinates using the provided truncation
-    /// offset. Messages are always sent, even for empty chunks, so that old
-    /// matches in the sub-range are cleared.
+    /// offset.
     DirtyRange { num_lines_truncated: u64 },
 }
 
@@ -226,43 +227,45 @@ async fn scan_grid_chunked(
                 .map(|range| AbsoluteMatch::from_range(range, grid_handler))
                 .collect();
 
+            let num_lines_truncated = match mode {
+                ScanResultMode::FullBlock => grid_handler.num_lines_truncated(),
+                ScanResultMode::DirtyRange {
+                    num_lines_truncated,
+                } => num_lines_truncated,
+            };
+            let absolute_row_range = current_row as u64 + num_lines_truncated
+                ..=(chunk_end - 1) as u64 + num_lines_truncated;
+
             let elapsed = lock_start.elapsed();
-            (matches, chunk_end, effective_end, elapsed)
+            (
+                matches,
+                absolute_row_range,
+                chunk_end,
+                effective_end,
+                elapsed,
+            )
         };
 
-        let (mut matches, chunk_end, effective_end, elapsed) = chunk_result;
+        let (mut matches, absolute_row_range, chunk_end, effective_end, elapsed) = chunk_result;
 
         // find_in_range returns matches in descending order; reverse to ascending.
         matches.reverse();
 
-        // Send chunk results based on mode.
-        match &mode {
-            ScanResultMode::FullBlock => {
-                if !matches.is_empty() {
-                    let _ = result_tx
-                        .send(FindTaskMessage::BlockGridMatches {
-                            block_index,
-                            grid_type,
-                            matches,
-                        })
-                        .await;
-                }
-            }
-            ScanResultMode::DirtyRange {
-                num_lines_truncated,
-            } => {
-                let absolute_start = current_row as u64 + num_lines_truncated;
-                let absolute_end = (chunk_end - 1) as u64 + num_lines_truncated;
-                let _ = result_tx
-                    .send(FindTaskMessage::DirtyRangeMatches {
-                        block_index,
-                        grid_type,
-                        dirty_range: absolute_start..=absolute_end,
-                        matches,
-                    })
-                    .await;
-            }
-        }
+        let message = match mode {
+            ScanResultMode::FullBlock => FindTaskMessage::BlockGridMatches {
+                block_index,
+                grid_type,
+                row_range: absolute_row_range,
+                matches,
+            },
+            ScanResultMode::DirtyRange { .. } => FindTaskMessage::DirtyRangeMatches {
+                block_index,
+                grid_type,
+                dirty_range: absolute_row_range,
+                matches,
+            },
+        };
+        let _ = result_tx.send(message).await;
 
         if chunk_end >= effective_end {
             break;
