@@ -636,11 +636,12 @@ fn cli_session_status_log_outcome(status: &CLIAgentSessionStatus) -> &'static st
 
 /// How to resume an existing conversation when starting an agent run.
 ///
-/// The Oz harness restores the full conversation transcript into the terminal pane and treats
-/// any new prompt as a follow-up; third-party harnesses round-trip a harness-specific payload
-/// (see [`ResumePayload`]) instead.
+/// Harnesses that render through a native conversation (Oz, and third-party harnesses driven
+/// over ACP) restore the full conversation into the terminal pane and treat any new prompt as a
+/// follow-up; terminal-driven third-party harnesses round-trip a harness-specific payload (see
+/// [`ResumePayload`]) instead.
 pub enum ResumeOptions {
-    Oz(Box<ConversationRestorationInNewPaneType>),
+    Native(Box<ConversationRestorationInNewPaneType>),
     ThirdParty(Box<ResumePayload>),
 }
 
@@ -1180,10 +1181,10 @@ impl AgentDriver {
         } = options;
 
         // Split the unified resume option into the two internal slots that the rest of
-        // the driver consumes: terminal-driven Oz transcript restoration vs. third-party
+        // the driver consumes: native conversation restoration vs. third-party
         // harness payload rehydration.
         let (conversation_restoration, resume_payload) = match resume {
-            Some(ResumeOptions::Oz(restoration)) => (Some(*restoration), None),
+            Some(ResumeOptions::Native(restoration)) => (Some(*restoration), None),
             Some(ResumeOptions::ThirdParty(payload)) => (None, Some(*payload)),
             None => (None, None),
         };
@@ -1214,7 +1215,7 @@ impl AgentDriver {
                     _ => None,
                 });
 
-        let mut env_vars = build_secret_env_vars(&secrets);
+        let mut env_vars = build_secret_env_vars(&secrets)?;
 
         // Inject cloud provider env vars.
         cloud_provider::collect_env_vars(&cloud_providers, &mut env_vars)?;
@@ -3422,6 +3423,8 @@ impl AgentDriver {
         let mut detected_runtime_failure: Option<harness_output_monitor::DetectedHarnessError> =
             None;
 
+        let mut save_requests = runner.save_requests();
+
         // Periodically save the conversation while the command is running and handle
         // exiting gracefully once the idle timeout elapses.
         let command_result = loop {
@@ -3435,6 +3438,25 @@ impl AgentDriver {
                         .await
                         .context("Failed to enqueue periodic harness conversation save"));
                 }
+                save_point = {
+                    let save_requests = save_requests.clone();
+                    async move {
+                        match save_requests {
+                            Some(save_requests) => save_requests.recv().await.ok(),
+                            None => future::pending().await,
+                        }
+                    }
+                }.fuse() => match save_point {
+                    Some(save_point) => {
+                        report_if_error!(runner
+                            .clone()
+                            .enqueue_save(save_point, foreground)
+                            .await
+                            .context("Failed to enqueue harness conversation save"));
+                    }
+                    // The runner closed its channel; stop polling it.
+                    None => save_requests = None,
+                },
                 _ = harness_exit_rx => {
                     let start_event = ExitEscalationEvent::ShutdownRequested {
                         awaiting_input: Self::session_blocked_on_needs_input(foreground).await,
@@ -4970,9 +4992,21 @@ impl AgentDriver {
 ///    if any one env var for a typed secret is already worker-injected, the entire
 ///    secret is skipped.
 /// 3. Generic `RawValue` secrets. Skipped on collision with either of the above.
+/// Metadata environment collisions are errors, including empty injected values.
 fn build_secret_env_vars(
     secrets: &HashMap<String, ManagedSecretValue>,
-) -> HashMap<OsString, OsString> {
+) -> Result<HashMap<OsString, OsString>, AgentDriverError> {
+    for (name, secret) in secrets {
+        let normalized_name = name.to_ascii_uppercase();
+        if matches!(secret, ManagedSecretValue::RawValue { .. })
+            && normalized_name.starts_with("WARP_METADATA_")
+            && std::env::var_os(&normalized_name).is_some()
+        {
+            return Err(AgentDriverError::EnvironmentSetupFailed(format!(
+                "Metadata environment variable {normalized_name} conflicts with managed secret {name:?}"
+            )));
+        }
+    }
     let mut env_vars = HashMap::with_capacity(secrets.len() + 1);
 
     // Phase 1: Record which env-var names are claimed by typed auth secrets.
@@ -5022,7 +5056,7 @@ fn build_secret_env_vars(
         env_vars.insert(OsString::from(env_name), OsString::from(value.as_str()));
     }
 
-    env_vars
+    Ok(env_vars)
 }
 
 /// The env-var names that any typed auth secret in `secrets` will populate.
