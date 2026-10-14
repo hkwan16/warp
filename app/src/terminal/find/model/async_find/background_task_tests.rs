@@ -3,34 +3,14 @@ use std::sync::Arc;
 use futures_lite::future::block_on;
 use parking_lot::FairMutex;
 use warp_terminal::model::grid::Dimensions as _;
-use warpui::r#async::executor::Background;
 
 use super::{ChunkRows, ROWS_PER_CHUNK, next_chunk_rows, scan_grid_chunked, scan_grid_range};
 use crate::terminal::block_list_element::GridType;
-use crate::terminal::color::{self, Colors};
-use crate::terminal::event_listener::ChannelEventListener;
 use crate::terminal::find::model::async_find::{AbsoluteMatch, FindTaskMessage};
 use crate::terminal::model::TerminalModel;
 use crate::terminal::model::find::{FindConfig, RegexDFAs};
-use crate::terminal::model::test_utils::block_size;
 
 const MAX_BLOCK_SCROLL_LIMIT: usize = 20;
-
-fn terminal_model_with_small_scrollback() -> TerminalModel {
-    let mut sizes = block_size();
-    sizes.max_block_scroll_limit = MAX_BLOCK_SCROLL_LIMIT;
-    TerminalModel::new_for_test(
-        sizes,
-        color::List::from(&Colors::default()),
-        ChannelEventListener::new_for_test(),
-        Arc::new(Background::default()),
-        false, /* should_show_bootstrap_block */
-        None,  /* restored_blocks */
-        false, /* honor_ps1 */
-        false, /* is_inverted */
-        None,  /* session_startup_path */
-    )
-}
 
 fn output_num_lines_truncated(model: &TerminalModel) -> u64 {
     model
@@ -61,7 +41,7 @@ fn foo_dfas() -> RegexDFAs {
 /// the results cover.
 #[test]
 fn test_dirty_range_scan_after_scrollback_truncation_scans_dirty_content() {
-    let mut model = terminal_model_with_small_scrollback();
+    let mut model = TerminalModel::mock_with_max_block_scroll_limit(MAX_BLOCK_SCROLL_LIMIT);
     model.simulate_long_running_block("cmd", &filler_lines(2 * MAX_BLOCK_SCROLL_LIMIT));
     let output_grid = model
         .block_list_mut()
