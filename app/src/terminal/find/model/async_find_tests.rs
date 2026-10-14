@@ -1191,6 +1191,14 @@ fn test_empty_non_overlapping_chunk_prunes_matches_truncated_from_scrollback() {
             &find_model,
             vec![grid_matches_for_block(0..=0, &[0])],
         );
+        let focused_match_index = find_model.update(&mut app, |model, _ctx| {
+            model
+                .async_find_controller
+                .as_ref()
+                .unwrap()
+                .focused_match_index()
+        });
+        assert_eq!(focused_match_index, Some(0));
 
         let num_lines_truncated = {
             let mut model = terminal_model.lock();
