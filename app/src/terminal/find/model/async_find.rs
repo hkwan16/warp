@@ -57,7 +57,8 @@ impl std::fmt::Display for AsyncFindStatus {
 /// Message streamed from background find task to main thread.
 #[derive(Debug)]
 pub enum FindTaskMessage {
-    /// Matches found in one chunk of a full scan of a terminal block's grid.
+    /// Matches found in one scanned chunk of a terminal block's grid, from either a full-block
+    /// or a dirty-range scan.
     BlockGridMatches {
         block_index: BlockIndex,
         grid_type: GridType,
@@ -65,14 +66,6 @@ pub enum FindTaskMessage {
         /// replaced, because results already in flight for this block (e.g. dirty-range results
         /// that land after a full rescan cleared the block) may have repopulated them.
         row_range: RangeInclusive<u64>,
-        matches: Vec<AbsoluteMatch>,
-    },
-    /// Matches found in a dirty range within a terminal block's grid.
-    DirtyRangeMatches {
-        block_index: BlockIndex,
-        grid_type: GridType,
-        /// The dirty range in absolute row coordinates, used for merging.
-        dirty_range: RangeInclusive<u64>,
         matches: Vec<AbsoluteMatch>,
     },
     /// Request to scan an AI block on the main thread.
@@ -348,6 +341,22 @@ impl BlockFindResults {
         self.terminal_matches
             .retain(|(idx, _), _| *idx != block_index);
         self.terminal_total_indices.remove(&block_index);
+    }
+
+    /// Returns whether any stored match for the block grid overlaps `rows`.
+    fn has_matches_in_rows(
+        &self,
+        block_index: BlockIndex,
+        grid_type: GridType,
+        rows: &RangeInclusive<u64>,
+    ) -> bool {
+        self.terminal_matches
+            .get(&(block_index, grid_type))
+            .is_some_and(|matches| {
+                matches
+                    .iter()
+                    .any(|m| m.start_row() <= *rows.end() && m.end_row() >= *rows.start())
+            })
     }
 
     /// Updates matches for a dirty range within a specific block grid.
@@ -872,6 +881,16 @@ impl AsyncFindController {
                 matches,
             } => {
                 let has_matches = !matches.is_empty();
+                // Nothing to add or clear, so skip the follow-up work, which locks the terminal
+                // model and rebuilds the focus order. Empty chunks are common for rare queries.
+                if !has_matches
+                    && !self
+                        .block_results
+                        .has_matches_in_rows(block_index, grid_type, &row_range)
+                {
+                    return;
+                }
+
                 // Store TotalIndex for this block if not already known
                 // (e.g. the block was added after the initial scan).
                 if has_matches
@@ -892,6 +911,10 @@ impl AsyncFindController {
                 self.block_results
                     .update_dirty_matches(block_index, grid_type, row_range, matches);
 
+                // Prune matches that have been truncated from scrollback, which can happen
+                // whenever the block receives new output.
+                self.prune_truncated_matches(block_index, grid_type);
+
                 // Auto-select the first match when results first arrive.
                 if has_matches && self.focused_match_index.is_none() {
                     self.focused_match_index = Some(0);
@@ -900,26 +923,6 @@ impl AsyncFindController {
                 // Mark any of the newly-arrived output matches that fall in
                 // filter-hidden rows so they're excluded from the count,
                 // focus, and highlights (also re-clamps focus).
-                self.recompute_filtered_for_block(block_index);
-            }
-            FindTaskMessage::DirtyRangeMatches {
-                block_index,
-                grid_type,
-                dirty_range,
-                matches,
-            } => {
-                self.block_results.update_dirty_matches(
-                    block_index,
-                    grid_type,
-                    dirty_range,
-                    matches,
-                );
-                // Prune matches that have been truncated from scrollback.
-                // Dirty range messages arrive when the active block receives
-                // new output, which is exactly when truncation can occur.
-                self.prune_truncated_matches(block_index, grid_type);
-                // Recompute filter-hidden state for the (possibly updated)
-                // output matches; also re-clamps the focused index.
                 self.recompute_filtered_for_block(block_index);
             }
             FindTaskMessage::ScanAIBlock {

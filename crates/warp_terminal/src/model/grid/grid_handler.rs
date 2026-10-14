@@ -1768,14 +1768,6 @@ impl GridHandler {
         });
     }
 
-    /// Returns the accumulated dirty row range for find operations in absolute rows, if any.
-    ///
-    /// Unlike `dirty_cells_range()`, this range accumulates across multiple byte
-    /// processing passes until explicitly consumed with `take_find_dirty_rows_range()`.
-    pub fn find_dirty_rows_range(&self) -> Option<RangeInclusive<u64>> {
-        self.find_dirty_rows_range.clone()
-    }
-
     /// Returns and clears the accumulated dirty row range for find operations, in absolute rows.
     ///
     /// This should be called when find has processed the dirty range and no longer
