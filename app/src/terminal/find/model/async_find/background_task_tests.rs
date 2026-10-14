@@ -5,9 +5,7 @@ use parking_lot::FairMutex;
 use warp_terminal::model::grid::Dimensions as _;
 use warpui::r#async::executor::Background;
 
-use super::{
-    ChunkRows, ROWS_PER_CHUNK, ScanResultMode, next_chunk_rows, scan_grid_chunked, scan_grid_range,
-};
+use super::{ChunkRows, ROWS_PER_CHUNK, next_chunk_rows, scan_grid_chunked, scan_grid_range};
 use crate::terminal::block_list_element::GridType;
 use crate::terminal::color::{self, Colors};
 use crate::terminal::event_listener::ChannelEventListener;
@@ -110,7 +108,6 @@ fn test_dirty_range_scan_after_scrollback_truncation_scans_dirty_content() {
         GridType::Output,
         *dirty_rows.start(),
         Some(*dirty_rows.end() + 1),
-        ScanResultMode::DirtyRange,
         &terminal_model,
         &dfas,
         &result_tx,
@@ -119,13 +116,13 @@ fn test_dirty_range_scan_after_scrollback_truncation_scans_dirty_content() {
 
     let mut match_rows = Vec::new();
     while let Ok(message) = result_rx.try_recv() {
-        let FindTaskMessage::DirtyRangeMatches {
-            dirty_range,
+        let FindTaskMessage::BlockGridMatches {
+            row_range: dirty_range,
             matches,
             ..
         } = message
         else {
-            panic!("Dirty-range scans should only send DirtyRangeMatches.");
+            panic!("Grid scans should only send BlockGridMatches.");
         };
         for absolute_match in &matches {
             assert!(

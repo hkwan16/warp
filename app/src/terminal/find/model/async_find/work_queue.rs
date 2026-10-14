@@ -71,8 +71,8 @@ impl FindWorkQueue {
 
     /// Populates the queue with initial scan items from a block info list.
     ///
-    /// Terminal blocks become [`FindWorkItem::ScanFullBlock`] items and rich
-    /// content blocks become [`FindWorkItem::ScanAIBlock`] items. Items are
+    /// Terminal blocks become [`FindWorkItem::FullBlock`] items and rich
+    /// content blocks become [`FindWorkItem::AIBlock`] items. Items are
     /// pushed in the order provided (typically newest-first from
     /// [`collect_block_info`](super::collect_block_info)).
     pub fn enqueue_full_scan(&self, blocks: &[BlockInfo]) {
@@ -99,7 +99,7 @@ impl FindWorkQueue {
 
     /// Enqueues work for a block that has been invalidated.
     ///
-    /// If a [`FindWorkItem::ScanFullBlock`] for this block is already pending in
+    /// If a [`FindWorkItem::FullBlock`] for this block is already pending in
     /// the queue, this is a no-op: the pending scan will pick up the latest
     /// content. Otherwise, the appropriate work item is pushed to the **front**
     /// of the queue so it is processed before remaining initial-scan items.

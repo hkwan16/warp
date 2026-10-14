@@ -982,20 +982,11 @@ fn process_messages(
     });
 }
 
-fn full_block_chunk(rows: RangeInclusive<u64>, match_rows: &[u64]) -> FindTaskMessage {
+fn grid_matches(rows: RangeInclusive<u64>, match_rows: &[u64]) -> FindTaskMessage {
     FindTaskMessage::BlockGridMatches {
         block_index: BlockIndex(0),
         grid_type: GridType::Output,
         row_range: rows,
-        matches: match_rows.iter().copied().map(make_match).collect(),
-    }
-}
-
-fn dirty_range(rows: RangeInclusive<u64>, match_rows: &[u64]) -> FindTaskMessage {
-    FindTaskMessage::DirtyRangeMatches {
-        block_index: BlockIndex(0),
-        grid_type: GridType::Output,
-        dirty_range: rows,
         matches: match_rows.iter().copied().map(make_match).collect(),
     }
 }
@@ -1025,8 +1016,8 @@ fn test_full_rescan_racing_in_flight_dirty_results_keeps_matches_sorted_and_uniq
             &mut app,
             &find_model,
             vec![
-                full_block_chunk(0..=49, &[0, 10, 20, 30, 40]),
-                full_block_chunk(50..=99, &[50, 60, 70, 80, 90]),
+                grid_matches(0..=49, &[0, 10, 20, 30, 40]),
+                grid_matches(50..=99, &[50, 60, 70, 80, 90]),
             ],
         );
 
@@ -1043,12 +1034,15 @@ fn test_full_rescan_racing_in_flight_dirty_results_keeps_matches_sorted_and_uniq
             &mut app,
             &find_model,
             vec![
-                dirty_range(70..=84, &[70, 80]),
-                dirty_range(85..=99, &[90]),
-                full_block_chunk(0..=49, &[0, 10, 20, 30, 40]),
-                full_block_chunk(50..=99, &[50, 60, 70, 80, 90]),
-                full_block_chunk(100..=105, &[100]),
-                dirty_range(100..=120, &[100, 110, 120]),
+                // Dirty-range results that were in flight before the invalidation.
+                grid_matches(70..=84, &[70, 80]),
+                grid_matches(85..=99, &[90]),
+                // The full rescan's chunks.
+                grid_matches(0..=49, &[0, 10, 20, 30, 40]),
+                grid_matches(50..=99, &[50, 60, 70, 80, 90]),
+                grid_matches(100..=105, &[100]),
+                // A later dirty-range result.
+                grid_matches(100..=120, &[100, 110, 120]),
             ],
         );
 
@@ -1073,9 +1067,11 @@ fn test_empty_full_block_chunk_clears_stale_matches_in_its_rows() {
             &mut app,
             &find_model,
             vec![
-                dirty_range(70..=84, &[70, 80]),
-                dirty_range(150..=160, &[150]),
-                full_block_chunk(0..=99, &[]),
+                // Dirty-range results that landed after the block was cleared.
+                grid_matches(70..=84, &[70, 80]),
+                grid_matches(150..=160, &[150]),
+                // An empty full-rescan chunk.
+                grid_matches(0..=99, &[]),
             ],
         );
 
@@ -1084,5 +1080,78 @@ fn test_empty_full_block_chunk_clears_stale_matches_in_its_rows() {
             model.async_find_controller.as_ref().unwrap().match_count()
         });
         assert_eq!(match_count, 1);
+        assert_eq!(
+            focused_match_row(&mut app, &find_model),
+            Some((BlockIndex(0), 150))
+        );
+    });
+}
+
+fn focused_match_row(
+    app: &mut App,
+    find_model: &ModelHandle<TerminalFindModel>,
+) -> Option<(BlockIndex, u64)> {
+    find_model.update(app, |model, _ctx| {
+        model
+            .async_find_controller
+            .as_ref()
+            .unwrap()
+            .focused_terminal_match()
+            .map(|focused| (focused.block_index, focused.range.start_row()))
+    })
+}
+
+#[test]
+fn test_matches_delivered_only_by_dirty_ranges_are_focusable() {
+    App::test((), |mut app| async move {
+        initialize_settings_for_tests(&mut app);
+        let find_model = add_find_model_with_active_find(&mut app);
+
+        process_messages(&mut app, &find_model, vec![grid_matches(0..=9, &[3, 7])]);
+
+        let match_count = find_model.update(&mut app, |model, _ctx| {
+            model.async_find_controller.as_ref().unwrap().match_count()
+        });
+        assert_eq!(match_count, 2);
+        // MostRecentLast focuses the bottom-most match first.
+        assert_eq!(
+            focused_match_row(&mut app, &find_model),
+            Some((BlockIndex(0), 7))
+        );
+
+        find_model.update(&mut app, |model, _ctx| {
+            model
+                .async_find_controller
+                .as_mut()
+                .unwrap()
+                .focus_next_match(FindDirection::Up);
+        });
+        assert_eq!(
+            focused_match_row(&mut app, &find_model),
+            Some((BlockIndex(0), 3))
+        );
+    });
+}
+
+#[test]
+fn test_empty_full_block_chunk_for_block_without_matches_leaves_results_untouched() {
+    App::test((), |mut app| async move {
+        initialize_settings_for_tests(&mut app);
+        let find_model = add_find_model_with_active_find(&mut app);
+
+        process_messages(&mut app, &find_model, vec![grid_matches(0..=999, &[])]);
+
+        let (block_grid_matches, focused_match_index) =
+            find_model.update(&mut app, |model, _ctx| {
+                let controller = model.async_find_controller.as_ref().unwrap();
+                (
+                    controller
+                        .matches_for_block_grid(BlockIndex(0), GridType::Output)
+                        .cloned(),
+                    controller.focused_match_index(),
+                )
+            });
+        assert_eq!(block_grid_matches, None);
+        assert_eq!(focused_match_index, None);
     });
 }

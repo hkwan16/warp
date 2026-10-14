@@ -91,7 +91,6 @@ async fn run_find_task_loop(
                     grid_type,
                     *row_range.start(),
                     Some(*row_range.end() + 1),
-                    ScanResultMode::DirtyRange,
                     &terminal_model,
                     &dfas,
                     &result_tx,
@@ -145,23 +144,12 @@ async fn scan_terminal_block_chunked(
             grid_type,
             0,
             None,
-            ScanResultMode::FullBlock,
             terminal_model,
             dfas,
             result_tx,
         )
         .await;
     }
-}
-
-/// Controls how each chunk's matches are sent to the main thread. Messages are always sent, even
-/// for empty chunks, so that old matches in the chunk's rows are cleared.
-#[derive(Clone, Copy)]
-enum ScanResultMode {
-    /// Send [`FindTaskMessage::BlockGridMatches`] per chunk.
-    FullBlock,
-    /// Send [`FindTaskMessage::DirtyRangeMatches`] per chunk.
-    DirtyRange,
 }
 
 /// The rows of one scan chunk, in both grid and absolute coordinates.
@@ -202,9 +190,9 @@ fn next_chunk_rows(
 /// Scans a range of rows within a single grid in chunks, releasing the
 /// terminal model lock between chunks to avoid blocking the main thread.
 ///
-/// Both full-block scanning and dirty-range scanning delegate to this
-/// function; the [`ScanResultMode`] determines the message type sent per
-/// chunk.
+/// Both full-block scanning and dirty-range scanning delegate to this function. A
+/// [`FindTaskMessage::BlockGridMatches`] is sent per chunk, even for empty chunks, so that old
+/// matches in the chunk's rows are cleared.
 ///
 /// Scan positions are tracked in absolute rows and converted to grid rows per chunk, under the same
 /// lock as the scan, because scrollback can be truncated while the lock is released.
@@ -213,14 +201,11 @@ fn next_chunk_rows(
 /// * `start_row` - First absolute row to scan (inclusive).
 /// * `end_row` - Upper bound on absolute rows to scan (exclusive). `None` scans to
 ///   the end of the grid.
-/// * `mode` - Determines the message type sent per chunk.
-#[allow(clippy::too_many_arguments)]
 async fn scan_grid_chunked(
     block_index: BlockIndex,
     grid_type: GridType,
     start_row: u64,
     end_row: Option<u64>,
-    mode: ScanResultMode,
     terminal_model: &Arc<FairMutex<TerminalModel>>,
     dfas: &RegexDFAs,
     result_tx: &async_channel::Sender<FindTaskMessage>,
@@ -274,21 +259,14 @@ async fn scan_grid_chunked(
         // find_in_range returns matches in descending order; reverse to ascending.
         matches.reverse();
 
-        let message = match mode {
-            ScanResultMode::FullBlock => FindTaskMessage::BlockGridMatches {
+        let _ = result_tx
+            .send(FindTaskMessage::BlockGridMatches {
                 block_index,
                 grid_type,
                 row_range: chunk.absolute_rows,
                 matches,
-            },
-            ScanResultMode::DirtyRange => FindTaskMessage::DirtyRangeMatches {
-                block_index,
-                grid_type,
-                dirty_range: chunk.absolute_rows,
-                matches,
-            },
-        };
-        let _ = result_tx.send(message).await;
+            })
+            .await;
 
         if chunk.is_last {
             break;
