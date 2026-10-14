@@ -952,6 +952,13 @@ fn test_focused_match_index_walks_across_terminal_and_ai_blocks() {
 /// task, so tests can deliver `FindTaskMessage`s in an exact order.
 fn add_find_model_with_active_find(app: &mut App) -> ModelHandle<TerminalFindModel> {
     let terminal_model = Arc::new(FairMutex::new(TerminalModel::mock(None, None)));
+    add_find_model_with_active_find_on(app, terminal_model)
+}
+
+fn add_find_model_with_active_find_on(
+    app: &mut App,
+    terminal_model: Arc<FairMutex<TerminalModel>>,
+) -> ModelHandle<TerminalFindModel> {
     app.add_model(|ctx| {
         let mut model = TerminalFindModel::new(terminal_model.clone(), ctx);
         let mut controller = AsyncFindController::new(terminal_model);
@@ -1152,6 +1159,74 @@ fn test_empty_full_block_chunk_for_block_without_matches_leaves_results_untouche
                 )
             });
         assert_eq!(block_grid_matches, None);
+        assert_eq!(focused_match_index, None);
+    });
+}
+
+/// Scrollback truncation can remove stored matches while every new chunk is empty and overlaps
+/// none of them, e.g. when a long run of non-matching output follows an early match.
+#[test]
+fn test_empty_non_overlapping_chunk_prunes_matches_truncated_from_scrollback() {
+    App::test((), |mut app| async move {
+        initialize_settings_for_tests(&mut app);
+        let max_block_scroll_limit = 20;
+        let terminal_model = Arc::new(FairMutex::new(
+            TerminalModel::mock_with_max_block_scroll_limit(max_block_scroll_limit),
+        ));
+        let block_index = {
+            let mut model = terminal_model.lock();
+            model.simulate_long_running_block("cmd", "foo\r\n");
+            model.block_list().active_block_index()
+        };
+        let find_model = add_find_model_with_active_find_on(&mut app, terminal_model.clone());
+        let grid_matches_for_block =
+            |rows: RangeInclusive<u64>, match_rows: &[u64]| FindTaskMessage::BlockGridMatches {
+                block_index,
+                grid_type: GridType::Output,
+                row_range: rows,
+                matches: match_rows.iter().copied().map(make_match).collect(),
+            };
+        process_messages(
+            &mut app,
+            &find_model,
+            vec![grid_matches_for_block(0..=0, &[0])],
+        );
+
+        let num_lines_truncated = {
+            let mut model = terminal_model.lock();
+            model.process_bytes("x\r\n".repeat(3 * max_block_scroll_limit).as_str());
+            model
+                .block_list()
+                .active_block()
+                .output_grid()
+                .grid_handler()
+                .num_lines_truncated()
+        };
+        assert!(num_lines_truncated > 0);
+
+        process_messages(
+            &mut app,
+            &find_model,
+            vec![grid_matches_for_block(
+                num_lines_truncated + 10..=num_lines_truncated + 15,
+                &[],
+            )],
+        );
+
+        let (stored_matches, match_count, focused_match_index) =
+            find_model.update(&mut app, |model, _ctx| {
+                let controller = model.async_find_controller.as_ref().unwrap();
+                (
+                    controller
+                        .matches_for_block_grid(block_index, GridType::Output)
+                        .cloned()
+                        .unwrap_or_default(),
+                    controller.match_count(),
+                    controller.focused_match_index(),
+                )
+            });
+        assert_eq!(stored_matches, vec![]);
+        assert_eq!(match_count, 0);
         assert_eq!(focused_match_index, None);
     });
 }

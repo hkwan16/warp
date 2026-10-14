@@ -881,43 +881,57 @@ impl AsyncFindController {
                 matches,
             } => {
                 let has_matches = !matches.is_empty();
-                // Nothing to add or clear, so skip the follow-up work, which locks the terminal
-                // model and rebuilds the focus order. Empty chunks are common for rare queries.
                 if !has_matches
                     && !self
                         .block_results
                         .has_matches_in_rows(block_index, grid_type, &row_range)
                 {
-                    return;
-                }
-
-                // Store TotalIndex for this block if not already known
-                // (e.g. the block was added after the initial scan).
-                if has_matches
-                    && !self
+                    // The chunk adds and clears nothing, so skip the follow-up work, which locks
+                    // the terminal model and rebuilds the focus order; empty chunks are common
+                    // for rare queries. New output may still have truncated older stored matches
+                    // from scrollback, so those are pruned first.
+                    let has_stored_matches = self
                         .block_results
-                        .terminal_total_indices
-                        .contains_key(&block_index)
-                {
-                    let total_index = {
-                        let model = self.terminal_model.lock();
-                        total_index_for_block(block_index, model.block_list())
-                    };
-                    self.block_results
-                        .terminal_total_indices
-                        .insert(block_index, total_index);
-                }
+                        .terminal_matches
+                        .get(&(block_index, grid_type))
+                        .is_some_and(|matches| !matches.is_empty());
+                    if !has_stored_matches || !self.prune_truncated_matches(block_index, grid_type)
+                    {
+                        return;
+                    }
+                } else {
+                    // Store TotalIndex for this block if not already known
+                    // (e.g. the block was added after the initial scan).
+                    if has_matches
+                        && !self
+                            .block_results
+                            .terminal_total_indices
+                            .contains_key(&block_index)
+                    {
+                        let total_index = {
+                            let model = self.terminal_model.lock();
+                            total_index_for_block(block_index, model.block_list())
+                        };
+                        self.block_results
+                            .terminal_total_indices
+                            .insert(block_index, total_index);
+                    }
 
-                self.block_results
-                    .update_dirty_matches(block_index, grid_type, row_range, matches);
+                    self.block_results.update_dirty_matches(
+                        block_index,
+                        grid_type,
+                        row_range,
+                        matches,
+                    );
 
-                // Prune matches that have been truncated from scrollback, which can happen
-                // whenever the block receives new output.
-                self.prune_truncated_matches(block_index, grid_type);
+                    // Prune matches that have been truncated from scrollback, which can happen
+                    // whenever the block receives new output.
+                    self.prune_truncated_matches(block_index, grid_type);
 
-                // Auto-select the first match when results first arrive.
-                if has_matches && self.focused_match_index.is_none() {
-                    self.focused_match_index = Some(0);
+                    // Auto-select the first match when results first arrive.
+                    if has_matches && self.focused_match_index.is_none() {
+                        self.focused_match_index = Some(0);
+                    }
                 }
 
                 // Mark any of the newly-arrived output matches that fall in
@@ -1070,12 +1084,12 @@ impl AsyncFindController {
     /// Prunes truncated matches for a specific block and grid type.
     ///
     /// This removes matches whose start row has been truncated from scrollback,
-    /// keeping the match count and focused index accurate.
-    fn prune_truncated_matches(&mut self, block_index: BlockIndex, grid_type: GridType) {
+    /// keeping the match count and focused index accurate. Returns whether any match was removed.
+    fn prune_truncated_matches(&mut self, block_index: BlockIndex, grid_type: GridType) -> bool {
         let num_lines_truncated = {
             let model = self.terminal_model.lock();
             let Some(block) = model.block_list().block_at(block_index) else {
-                return;
+                return false;
             };
             match grid_type {
                 GridType::Output => block.output_grid().grid_handler().num_lines_truncated(),
@@ -1083,21 +1097,24 @@ impl AsyncFindController {
                     .prompt_and_command_grid()
                     .grid_handler()
                     .num_lines_truncated(),
-                _ => return,
+                _ => return false,
             }
         };
 
         if num_lines_truncated == 0 {
-            return;
+            return false;
         }
 
-        if let Some(matches) = self
+        let Some(matches) = self
             .block_results
             .terminal_matches
             .get_mut(&(block_index, grid_type))
-        {
-            matches.retain(|m| !m.is_truncated(num_lines_truncated));
-        }
+        else {
+            return false;
+        };
+        let num_matches = matches.len();
+        matches.retain(|m| !m.is_truncated(num_lines_truncated));
+        matches.len() < num_matches
     }
 
     /// Recomputes `is_filtered` for the Output-grid matches of `block_index`,
