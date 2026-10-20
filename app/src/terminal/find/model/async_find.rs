@@ -1097,7 +1097,7 @@ impl AsyncFindController {
                     .prompt_and_command_grid()
                     .grid_handler()
                     .num_lines_truncated(),
-                _ => return false,
+                GridType::Prompt | GridType::Rprompt => return false,
             }
         };
 

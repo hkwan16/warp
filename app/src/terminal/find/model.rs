@@ -172,7 +172,7 @@ impl<'a> BlockFindRenderData<'a> {
             } => match grid_type {
                 GridType::PromptAndCommand => focused_command_range.clone(),
                 GridType::Output => focused_output_range.clone(),
-                _ => None,
+                GridType::Prompt | GridType::Rprompt => None,
             },
         }
     }
@@ -313,7 +313,7 @@ impl TerminalFindModel {
                 let grid = match async_match.grid_type {
                     GridType::PromptAndCommand => block.prompt_and_command_grid().grid_handler(),
                     GridType::Output => block.output_grid().grid_handler(),
-                    _ => return None,
+                    GridType::Prompt | GridType::Rprompt => return None,
                 };
                 let range = async_match.range.to_range(grid)?;
                 return Some(BlockListMatch::CommandBlock(BlockGridMatch {

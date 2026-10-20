@@ -225,7 +225,7 @@ async fn scan_grid_chunked(
             let grid = match grid_type {
                 GridType::Output => block.output_grid(),
                 GridType::PromptAndCommand => block.prompt_and_command_grid(),
-                _ => return,
+                GridType::Prompt | GridType::Rprompt => return,
             };
 
             let grid_handler = grid.grid_handler();
