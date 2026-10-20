@@ -23,6 +23,7 @@ use super::rich_content::{FindableRichContentHandle, RichContentMatchId};
 use crate::terminal::block_list_element::GridType;
 use crate::terminal::find::model::TerminalFindModel;
 use crate::terminal::model::TerminalModel;
+use crate::terminal::model::block::Block;
 use crate::terminal::model::blocks::{
     BlockHeight, BlockHeightItem, BlockHeightSummary, BlockList, TotalIndex,
 };
@@ -57,14 +58,16 @@ impl std::fmt::Display for AsyncFindStatus {
 /// Message streamed from background find task to main thread.
 #[derive(Debug)]
 pub enum FindTaskMessage {
-    /// Matches found in one scanned chunk of a terminal block's grid, from either a full-block
-    /// or a dirty-range scan.
+    /// Matches found in one chunk of a terminal block's grid, from either a full-block or a
+    /// dirty-range scan.
     BlockGridMatches {
         block_index: BlockIndex,
         grid_type: GridType,
-        /// The scanned rows in absolute row coordinates. Existing matches in these rows are
-        /// replaced, because results already in flight for this block (e.g. dirty-range results
-        /// that land after a full rescan cleared the block) may have repopulated them.
+        /// The rows these matches cover, in absolute row coordinates. Rows that were no longer in
+        /// the grid when scanned (e.g. truncated from scrollback) are covered with no matches.
+        /// Existing matches in these rows are replaced, because results already in flight for this
+        /// block (e.g. dirty-range results that land after a full rescan cleared the block) may
+        /// have repopulated them.
         row_range: RangeInclusive<u64>,
         matches: Vec<AbsoluteMatch>,
     },
@@ -1088,17 +1091,14 @@ impl AsyncFindController {
     fn prune_truncated_matches(&mut self, block_index: BlockIndex, grid_type: GridType) -> bool {
         let num_lines_truncated = {
             let model = self.terminal_model.lock();
-            let Some(block) = model.block_list().block_at(block_index) else {
+            let Some(grid_handler) = model
+                .block_list()
+                .block_at(block_index)
+                .and_then(|block| searchable_grid_handler(block, grid_type))
+            else {
                 return false;
             };
-            match grid_type {
-                GridType::Output => block.output_grid().grid_handler().num_lines_truncated(),
-                GridType::PromptAndCommand => block
-                    .prompt_and_command_grid()
-                    .grid_handler()
-                    .num_lines_truncated(),
-                GridType::Prompt | GridType::Rprompt => return false,
-            }
+            grid_handler.num_lines_truncated()
         };
 
         if num_lines_truncated == 0 {
@@ -1393,6 +1393,16 @@ pub fn collect_block_info(block_list: &BlockList, config: &AsyncFindConfig) -> V
     }
 
     block_info
+}
+
+/// Returns the handler of `block`'s grid of `grid_type`, or `None` for grid types that async find
+/// does not search.
+pub(super) fn searchable_grid_handler(block: &Block, grid_type: GridType) -> Option<&GridHandler> {
+    match grid_type {
+        GridType::Output => Some(block.output_grid().grid_handler()),
+        GridType::PromptAndCommand => Some(block.prompt_and_command_grid().grid_handler()),
+        GridType::Prompt | GridType::Rprompt => None,
+    }
 }
 
 /// Computes the TotalIndex for a terminal block at the given BlockIndex.

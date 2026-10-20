@@ -15,7 +15,7 @@ use warp_terminal::model::grid::Dimensions;
 use warpui::{Entity, ModelContext};
 
 use super::work_queue::{FindWorkItem, FindWorkQueue};
-use super::{AbsoluteMatch, AsyncFindConfig, FindTaskMessage};
+use super::{AbsoluteMatch, AsyncFindConfig, FindTaskMessage, searchable_grid_handler};
 use crate::terminal::block_list_element::GridType;
 use crate::terminal::model::TerminalModel;
 use crate::terminal::model::find::{FindConfig, RegexDFAs};
@@ -155,6 +155,7 @@ async fn scan_terminal_block_chunked(
 /// The rows of one scan chunk, in both grid and absolute coordinates.
 #[derive(Debug, PartialEq, Eq)]
 struct ChunkRows {
+    /// The grid rows to scan, which are empty if none of the chunk's rows are in the grid.
     grid_rows: Range<usize>,
     absolute_rows: RangeInclusive<u64>,
     /// Whether this chunk reaches the end of the requested range (or of the grid).
@@ -163,8 +164,12 @@ struct ChunkRows {
 
 /// Returns the next chunk of rows to scan, starting at absolute row `absolute_start` and ending
 /// before absolute row `absolute_end` (or at the end of the grid if `None`), given the grid's
-/// current truncation and size. Rows already truncated from scrollback are skipped. Returns
-/// `None` if no rows of the range remain in the grid.
+/// current truncation and size. Rows already truncated from scrollback are skipped.
+///
+/// If none of the remaining rows of a bounded range are in the grid (e.g. they were truncated from
+/// scrollback, possibly with stored matches, before or during the scan), returns a last chunk
+/// with no grid rows that covers all of them, so that matches stored in those rows are still
+/// cleared. Returns `None` if an unbounded scan has no rows left.
 fn next_chunk_rows(
     absolute_start: u64,
     absolute_end: Option<u64>,
@@ -177,7 +182,12 @@ fn next_chunk_rows(
         .map_or(total_rows, |end| end.saturating_sub(num_lines_truncated))
         .min(total_rows);
     if grid_start >= grid_end {
-        return None;
+        let absolute_end = absolute_end.filter(|&end| absolute_start < end)?;
+        return Some(ChunkRows {
+            grid_rows: 0..0,
+            absolute_rows: absolute_start..=absolute_end - 1,
+            is_last: true,
+        });
     }
     let chunk_end = (grid_start + ROWS_PER_CHUNK as u64).min(grid_end);
     Some(ChunkRows {
@@ -192,7 +202,7 @@ fn next_chunk_rows(
 ///
 /// Both full-block scanning and dirty-range scanning delegate to this function. A
 /// [`FindTaskMessage::BlockGridMatches`] is sent per chunk, even for empty chunks, so that old
-/// matches in the chunk's rows are cleared.
+/// matches in the chunk's rows are cleared and matches truncated from scrollback are pruned.
 ///
 /// Scan positions are tracked in absolute rows and converted to grid rows per chunk, under the same
 /// lock as the scan, because scrollback can be truncated while the lock is released.
@@ -213,7 +223,7 @@ async fn scan_grid_chunked(
     let mut current_row = start_row;
 
     loop {
-        let chunk_result = {
+        let (mut matches, chunk, elapsed) = {
             let lock_start = Instant::now();
             let model = terminal_model.lock();
 
@@ -221,14 +231,9 @@ async fn scan_grid_chunked(
                 // Block no longer exists.
                 return;
             };
-
-            let grid = match grid_type {
-                GridType::Output => block.output_grid(),
-                GridType::PromptAndCommand => block.prompt_and_command_grid(),
-                GridType::Prompt | GridType::Rprompt => return,
+            let Some(grid_handler) = searchable_grid_handler(block, grid_type) else {
+                return;
             };
-
-            let grid_handler = grid.grid_handler();
             let Some(chunk) = next_chunk_rows(
                 current_row,
                 end_row,
@@ -249,11 +254,8 @@ async fn scan_grid_chunked(
                 .map(|range| AbsoluteMatch::from_range(range, grid_handler))
                 .collect();
 
-            let elapsed = lock_start.elapsed();
-            (matches, chunk, elapsed)
+            (matches, chunk, lock_start.elapsed())
         };
-
-        let (mut matches, chunk, elapsed) = chunk_result;
         let next_row = *chunk.absolute_rows.end() + 1;
 
         // find_in_range returns matches in descending order; reverse to ascending.
@@ -281,18 +283,46 @@ async fn scan_grid_chunked(
     }
 }
 
-/// Scans a range of rows in a grid for matches.
+/// Scans the grid rows from `start_row` (inclusive) to `end_row` (exclusive) for matches.
 fn scan_grid_range(
     grid: &GridHandler,
     dfas: &RegexDFAs,
     start_row: usize,
     end_row: usize,
 ) -> Vec<RangeInclusive<Point>> {
+    // The inclusive end point below would otherwise make an empty range scan row `end_row - 1`.
+    if start_row >= end_row {
+        return Vec::new();
+    }
     let columns = Dimensions::columns(grid);
     let start_point = Point::new(start_row, 0);
     let end_point = Point::new(end_row.saturating_sub(1), columns.saturating_sub(1));
 
     grid.find_in_range(dfas, start_point, end_point).collect()
+}
+
+/// Runs [`scan_grid_chunked`] to completion and returns the messages it sent.
+#[cfg(test)]
+pub(super) fn scan_grid_messages(
+    block_index: BlockIndex,
+    grid_type: GridType,
+    start_row: u64,
+    end_row: Option<u64>,
+    terminal_model: &Arc<FairMutex<TerminalModel>>,
+    dfas: &RegexDFAs,
+) -> Vec<FindTaskMessage> {
+    let (result_tx, result_rx) = async_channel::unbounded();
+    futures_lite::future::block_on(scan_grid_chunked(
+        block_index,
+        grid_type,
+        start_row,
+        end_row,
+        terminal_model,
+        dfas,
+        &result_tx,
+    ));
+    drop(result_tx);
+    std::iter::from_fn(|| result_rx.try_recv().ok()).collect()
 }
 
 #[cfg(test)]
