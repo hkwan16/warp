@@ -11,6 +11,7 @@ use std::ops::RangeInclusive;
 use std::sync::Arc;
 
 use alt_screen::{AltScreenFindRun, run_find_on_alt_screen};
+use async_find::searchable_grid_handler;
 pub use async_find::{AsyncFindController, AsyncFindStatus};
 use block_list::run_find_on_block_list;
 pub use block_list::{BlockGridMatch, BlockListFindRun, BlockListMatch};
@@ -310,11 +311,7 @@ impl TerminalFindModel {
             // to know which path produced the focus.
             if let Some(async_match) = controller.focused_terminal_match() {
                 let block = model.block_list().block_at(async_match.block_index)?;
-                let grid = match async_match.grid_type {
-                    GridType::PromptAndCommand => block.prompt_and_command_grid().grid_handler(),
-                    GridType::Output => block.output_grid().grid_handler(),
-                    GridType::Prompt | GridType::Rprompt => return None,
-                };
+                let grid = searchable_grid_handler(block, async_match.grid_type)?;
                 let range = async_match.range.to_range(grid)?;
                 return Some(BlockListMatch::CommandBlock(BlockGridMatch {
                     block_index: async_match.block_index,

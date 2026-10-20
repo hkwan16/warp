@@ -1,14 +1,14 @@
 use std::sync::Arc;
 
-use futures_lite::future::block_on;
 use parking_lot::FairMutex;
 use warp_terminal::model::grid::Dimensions as _;
 
-use super::{ChunkRows, ROWS_PER_CHUNK, next_chunk_rows, scan_grid_chunked, scan_grid_range};
+use super::{ChunkRows, ROWS_PER_CHUNK, next_chunk_rows, scan_grid_messages, scan_grid_range};
 use crate::terminal::block_list_element::GridType;
 use crate::terminal::find::model::async_find::{AbsoluteMatch, FindTaskMessage};
 use crate::terminal::model::TerminalModel;
 use crate::terminal::model::find::{FindConfig, RegexDFAs};
+use crate::terminal::model::terminal_model::BlockIndex;
 
 const MAX_BLOCK_SCROLL_LIMIT: usize = 20;
 
@@ -34,6 +34,88 @@ fn foo_dfas() -> RegexDFAs {
         },
     )
     .unwrap()
+}
+
+/// Scans the output grid for "foo" from `start_row` up to `end_row` (or the end of the grid) and
+/// returns the messages sent.
+fn scan_output_messages(
+    terminal_model: &Arc<FairMutex<TerminalModel>>,
+    block_index: BlockIndex,
+    start_row: u64,
+    end_row: Option<u64>,
+) -> Vec<FindTaskMessage> {
+    scan_grid_messages(
+        block_index,
+        GridType::Output,
+        start_row,
+        end_row,
+        terminal_model,
+        &foo_dfas(),
+    )
+}
+
+/// Returns a running block whose output scrollback has been truncated, with its block index and
+/// the output grid's number of truncated lines.
+fn model_with_truncated_output() -> (Arc<FairMutex<TerminalModel>>, BlockIndex, u64) {
+    let mut model = TerminalModel::mock_with_max_block_scroll_limit(MAX_BLOCK_SCROLL_LIMIT);
+    model.simulate_long_running_block("cmd", &filler_lines(3 * MAX_BLOCK_SCROLL_LIMIT));
+    let num_lines_truncated = output_num_lines_truncated(&model);
+    let block_index = model.block_list().active_block_index();
+    (
+        Arc::new(FairMutex::new(model)),
+        block_index,
+        num_lines_truncated,
+    )
+}
+
+/// A bounded range that is entirely gone from the grid when it is scanned is still reported, as
+/// one empty chunk covering the whole range, so the handler clears and prunes its rows.
+#[test]
+fn test_bounded_scan_of_truncated_range_sends_one_empty_chunk_for_range() {
+    let (terminal_model, block_index, num_lines_truncated) = model_with_truncated_output();
+    assert!(num_lines_truncated > 5);
+
+    let messages = scan_output_messages(&terminal_model, block_index, 2, Some(5));
+
+    let [
+        FindTaskMessage::BlockGridMatches {
+            block_index: message_block_index,
+            grid_type,
+            row_range,
+            matches,
+        },
+    ] = messages.as_slice()
+    else {
+        panic!("Expected exactly one BlockGridMatches, got {messages:?}.");
+    };
+    assert_eq!(*message_block_index, block_index);
+    assert_eq!(*grid_type, GridType::Output);
+    assert_eq!(*row_range, 2..=4);
+    assert!(matches.is_empty());
+}
+
+#[test]
+fn test_unbounded_scan_with_no_rows_left_sends_nothing() {
+    let (terminal_model, block_index, num_lines_truncated) = model_with_truncated_output();
+    let total_rows = terminal_model
+        .lock()
+        .block_list()
+        .active_block()
+        .output_grid()
+        .grid_handler()
+        .total_rows() as u64;
+
+    let messages = scan_output_messages(
+        &terminal_model,
+        block_index,
+        num_lines_truncated + total_rows,
+        None,
+    );
+
+    assert!(
+        messages.is_empty(),
+        "Expected no messages, got {messages:?}."
+    );
 }
 
 /// Regression test: scrollback truncation while dirty rows accumulate, and between enqueueing a
@@ -82,20 +164,15 @@ fn test_dirty_range_scan_after_scrollback_truncation_scans_dirty_content() {
 
     let block_index = model.block_list().active_block_index();
     let terminal_model = Arc::new(FairMutex::new(model));
-    let (result_tx, result_rx) = async_channel::unbounded();
-    block_on(scan_grid_chunked(
+    let messages = scan_output_messages(
+        &terminal_model,
         block_index,
-        GridType::Output,
         *dirty_rows.start(),
         Some(*dirty_rows.end() + 1),
-        &terminal_model,
-        &dfas,
-        &result_tx,
-    ));
-    drop(result_tx);
+    );
 
     let mut match_rows = Vec::new();
-    while let Ok(message) = result_rx.try_recv() {
+    for message in messages {
         let FindTaskMessage::BlockGridMatches {
             row_range: dirty_range,
             matches,
@@ -164,7 +241,38 @@ fn test_next_chunk_rows_skips_rows_truncated_since_the_range_was_recorded() {
             is_last: true,
         })
     );
-    assert_eq!(next_chunk_rows(105, Some(110), 110, 50), None);
+}
+
+#[test]
+fn test_next_chunk_rows_covers_bounded_range_gone_from_grid_without_grid_rows() {
+    let gone_chunk = |absolute_rows| {
+        Some(ChunkRows {
+            grid_rows: 0..0,
+            absolute_rows,
+            is_last: true,
+        })
+    };
+    assert_eq!(
+        next_chunk_rows(105, Some(110), 110, 50),
+        gone_chunk(105..=109)
+    );
+    assert_eq!(next_chunk_rows(60, Some(70), 0, 50), gone_chunk(60..=69));
+    assert_eq!(next_chunk_rows(60, None, 0, 50), None);
+}
+
+#[test]
+fn test_scan_grid_range_of_empty_range_finds_nothing() {
+    let mut model = TerminalModel::mock_with_max_block_scroll_limit(MAX_BLOCK_SCROLL_LIMIT);
+    model.simulate_long_running_block("cmd", "foo\r\n");
+    let grid_handler = model
+        .block_list()
+        .active_block()
+        .output_grid()
+        .grid_handler();
+    let dfas = foo_dfas();
+    assert_eq!(scan_grid_range(grid_handler, &dfas, 0, 1).len(), 1);
+
+    assert_eq!(scan_grid_range(grid_handler, &dfas, 0, 0), vec![]);
 }
 
 #[test]

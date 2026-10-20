@@ -7,10 +7,11 @@ use std::sync::Arc;
 use parking_lot::FairMutex;
 use warpui::{App, EntityId, ModelHandle};
 
+use super::background_task::scan_grid_messages;
 use super::work_queue::FindWorkQueue;
 use super::{
     AbsoluteMatch, AsyncFindConfig, AsyncFindController, AsyncFindStatus, BlockFindResults,
-    FindTaskMessage, is_query_refinement,
+    FindTaskMessage, is_query_refinement, searchable_grid_handler,
 };
 use crate::terminal::block_list_element::GridType;
 use crate::terminal::find::model::block_list::run_find_on_block_list;
@@ -18,6 +19,7 @@ use crate::terminal::find::model::{FindOptions, TerminalFindModel};
 use crate::terminal::find::{BlockListMatch, RichContentMatchId};
 use crate::terminal::model::TerminalModel;
 use crate::terminal::model::blocks::TotalIndex;
+use crate::terminal::model::find::{FindConfig, RegexDFAs};
 use crate::terminal::model::grid::grid_handler::AbsolutePoint;
 use crate::terminal::model::index::Point;
 use crate::terminal::model::terminal_model::{BlockIndex, BlockSortDirection};
@@ -147,10 +149,8 @@ fn test_async_find_produces_same_results_as_sync_find() {
 
                 // Convert async match to relative range and compare.
                 let block = model.block_list().block_at(grid_match.block_index).unwrap();
-                let grid = match grid_match.grid_type {
-                    GridType::Output => block.output_grid().grid_handler(),
-                    GridType::PromptAndCommand => block.prompt_and_command_grid().grid_handler(),
-                    _ => continue,
+                let Some(grid) = searchable_grid_handler(block, grid_match.grid_type) else {
+                    continue;
                 };
 
                 let async_ranges: Vec<_> = async_matches
@@ -775,13 +775,8 @@ fn assert_async_focused_order_matches_sync(block_sort_direction: BlockSortDirect
                         .block_list()
                         .block_at(block_index)
                         .expect("Block should exist for focused async match.");
-                    let grid = match grid_type {
-                        GridType::Output => block.output_grid().grid_handler(),
-                        GridType::PromptAndCommand => {
-                            block.prompt_and_command_grid().grid_handler()
-                        }
-                        _ => panic!("Unexpected grid type in async focused match."),
-                    };
+                    let grid = searchable_grid_handler(block, grid_type)
+                        .expect("Unexpected grid type in async focused match.");
                     let range = absolute_match
                         .to_range(grid)
                         .expect("Async focused match should map to a non-truncated range.");
@@ -1191,25 +1186,11 @@ fn test_empty_non_overlapping_chunk_prunes_matches_truncated_from_scrollback() {
             &find_model,
             vec![grid_matches_for_block(0..=0, &[0])],
         );
-        let focused_match_index = find_model.update(&mut app, |model, _ctx| {
-            model
-                .async_find_controller
-                .as_ref()
-                .unwrap()
-                .focused_match_index()
-        });
+        let (_, _, focused_match_index) = output_match_state(&mut app, &find_model, block_index);
         assert_eq!(focused_match_index, Some(0));
 
-        let num_lines_truncated = {
-            let mut model = terminal_model.lock();
-            model.process_bytes("x\r\n".repeat(3 * max_block_scroll_limit).as_str());
-            model
-                .block_list()
-                .active_block()
-                .output_grid()
-                .grid_handler()
-                .num_lines_truncated()
-        };
+        let num_lines_truncated =
+            truncate_active_output_scrollback(&terminal_model, max_block_scroll_limit);
         assert!(num_lines_truncated > 0);
 
         process_messages(
@@ -1221,20 +1202,115 @@ fn test_empty_non_overlapping_chunk_prunes_matches_truncated_from_scrollback() {
             )],
         );
 
-        let (stored_matches, match_count, focused_match_index) =
-            find_model.update(&mut app, |model, _ctx| {
-                let controller = model.async_find_controller.as_ref().unwrap();
-                (
-                    controller
-                        .matches_for_block_grid(block_index, GridType::Output)
-                        .cloned()
-                        .unwrap_or_default(),
-                    controller.match_count(),
-                    controller.focused_match_index(),
-                )
-            });
-        assert_eq!(stored_matches, vec![]);
-        assert_eq!(match_count, 0);
-        assert_eq!(focused_match_index, None);
+        assert_eq!(
+            output_match_state(&mut app, &find_model, block_index),
+            (vec![], 0, None)
+        );
+    });
+}
+
+/// Writes enough filler output to the active block to truncate its output scrollback, and returns
+/// the output grid's number of truncated lines.
+fn truncate_active_output_scrollback(
+    terminal_model: &Arc<FairMutex<TerminalModel>>,
+    max_block_scroll_limit: usize,
+) -> u64 {
+    let mut model = terminal_model.lock();
+    model.process_bytes("x\r\n".repeat(3 * max_block_scroll_limit).as_str());
+    model
+        .block_list()
+        .active_block()
+        .output_grid()
+        .grid_handler()
+        .num_lines_truncated()
+}
+
+/// Returns the controller's stored output-grid matches for `block_index`, its match count, and
+/// its focused match index.
+fn output_match_state(
+    app: &mut App,
+    find_model: &ModelHandle<TerminalFindModel>,
+    block_index: BlockIndex,
+) -> (Vec<AbsoluteMatch>, usize, Option<usize>) {
+    find_model.update(app, |model, _ctx| {
+        let controller = model.async_find_controller.as_ref().unwrap();
+        (
+            controller
+                .matches_for_block_grid(block_index, GridType::Output)
+                .cloned()
+                .unwrap_or_default(),
+            controller.match_count(),
+            controller.focused_match_index(),
+        )
+    })
+}
+
+/// Regression test: a dirty range that is truncated from scrollback in full between being enqueued
+/// and being scanned must still prune the stored matches that were truncated with it.
+#[test]
+fn test_dirty_range_truncated_before_scan_prunes_truncated_matches() {
+    App::test((), |mut app| async move {
+        initialize_settings_for_tests(&mut app);
+        let max_block_scroll_limit = 20;
+        let mut model = TerminalModel::mock_with_max_block_scroll_limit(max_block_scroll_limit);
+        model.simulate_long_running_block("cmd", "");
+        let take_output_dirty_rows = |model: &mut TerminalModel| {
+            model
+                .block_list_mut()
+                .active_block_mut()
+                .grid_of_type_mut(GridType::Output)
+                .unwrap()
+                .grid_handler_mut()
+                .take_find_dirty_rows_range()
+        };
+        take_output_dirty_rows(&mut model);
+        model.process_bytes("foo\r\n");
+        let dirty_rows = take_output_dirty_rows(&mut model).unwrap();
+        let block_index = model.block_list().active_block_index();
+        let terminal_model = Arc::new(FairMutex::new(model));
+        let find_model = add_find_model_with_active_find_on(&mut app, terminal_model.clone());
+        let dfas = RegexDFAs::new_with_config(
+            "foo",
+            FindConfig {
+                is_regex_enabled: false,
+                is_case_sensitive: false,
+            },
+        )
+        .unwrap();
+
+        // A full scan stores the match before the dirty range is scanned.
+        let messages = scan_grid_messages(
+            block_index,
+            GridType::Output,
+            0,
+            None,
+            &terminal_model,
+            &dfas,
+        );
+        process_messages(&mut app, &find_model, messages);
+        let (_, match_count, focused_match_index) =
+            output_match_state(&mut app, &find_model, block_index);
+        assert_eq!(match_count, 1);
+        assert_eq!(focused_match_index, Some(0));
+
+        // Truncate the entire dirty range, and the stored match with it, before the scan runs.
+        let num_lines_truncated =
+            truncate_active_output_scrollback(&terminal_model, max_block_scroll_limit);
+        assert!(num_lines_truncated > *dirty_rows.end());
+
+        let messages = scan_grid_messages(
+            block_index,
+            GridType::Output,
+            *dirty_rows.start(),
+            Some(*dirty_rows.end() + 1),
+            &terminal_model,
+            &dfas,
+        );
+        process_messages(&mut app, &find_model, messages);
+
+        assert_eq!(
+            output_match_state(&mut app, &find_model, block_index),
+            (vec![], 0, None)
+        );
     });
 }
